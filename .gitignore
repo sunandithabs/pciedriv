@@ -1,0 +1,15 @@
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+initramfs.gz
+rootfs/
+test
+initramfs.gz
+rootfs/
+test

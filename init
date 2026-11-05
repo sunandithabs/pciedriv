@@ -7,6 +7,7 @@ exec >/dev/console 2>&1 </dev/console
 echo "== uname: $(uname -r)"
 insmod /edu_drv.ko $MODARGS
 /test
+echo "== stats"; cat /sys/kernel/debug/edu/stats
 echo "== dmesg"; dmesg | grep -iE "edu|oops|bug" 
 grep -q shell /proc/cmdline && exec sh
 poweroff -f

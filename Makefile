@@ -10,4 +10,3 @@ test: test.c edu_uapi.h
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
 	rm -rf test rootfs initramfs.gz
-ccflags-y += -g

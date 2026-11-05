@@ -1,6 +1,4 @@
 #!/bin/bash
-# usage: ./run.sh            -> build, run tests, auto power off
-#        ./run.sh shell      -> drop to shell (gdb/ftrace/oops practice)
 set -e
 cd "$(dirname "$0")"
 KIMG=${KIMG:-/boot/vmlinuz-$(uname -r)}

@@ -1,4 +1,4 @@
-# edu-pcie-driver
+# pciedriv
 
 Linux PCIe driver for QEMU's `edu` educational device (`1234:11e8`). Covers BAR/MMIO mapping, MSI interrupts, coherent DMA under a 28-bit mask, and a misc character device, with a self-contained QEMU test harness.
 

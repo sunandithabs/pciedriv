@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <poll.h>
 #include "edu_uapi.h"
 static int fails;
 #define CHECK(name, cond) do { int ok_ = !!(cond); \
@@ -17,6 +18,24 @@ static int do_fact(int fd, __u32 n, __u32 *out)
 	int rc = ioctl(fd, EDU_IOC_FACT, &v);
 	*out = v;
 	return rc;
+}
+static void set_timeout(int ms)
+{
+	FILE *f = fopen("/sys/module/edu_drv/parameters/timeout_ms", "w");
+	if (!f) return;
+	fprintf(f, "%d", ms);
+	fclose(f);
+}
+static long read_timeouts(void)
+{
+	char line[64];
+	long n = -1;
+	FILE *f = fopen("/sys/kernel/debug/edu/stats", "r");
+	if (!f) return -1;
+	while (fgets(line, sizeof(line), f))
+		if (sscanf(line, "timeouts %ld", &n) == 1) break;
+	fclose(f);
+	return n;
 }
 int main(int argc, char **argv)
 {
@@ -56,6 +75,36 @@ int main(int argc, char **argv)
 		}
 	for (i = 0, bad = 0; i < 4; i++) { wait(&st); bad |= st; }
 	CHECK("4x200 concurrent fact", !bad);
+	{
+		struct pollfd p = { .fd = fd, .events = POLLIN };
+		int rc;
+		errno = 0;
+		CHECK("unknown ioctl = ENOTTY", ioctl(fd, _IO('E', 99)) < 0 && errno == ENOTTY);
+		errno = 0;
+		CHECK("bad pointer = EFAULT", ioctl(fd, EDU_IOC_FACT, (void *)1) < 0 && errno == EFAULT);
+		v = 10;
+		CHECK("async fact start", !ioctl(fd, EDU_IOC_FACT_START, &v));
+		v = 3;
+		errno = 0;
+		CHECK("second start = EBUSY", ioctl(fd, EDU_IOC_FACT_START, &v) < 0 && errno == EBUSY);
+		errno = 0;
+		CHECK("sync fact while pending = EBUSY", do_fact(fd, 3, &v) < 0 && errno == EBUSY);
+		rc = poll(&p, 1, 2000);
+		CHECK("poll reports POLLIN", rc == 1 && (p.revents & POLLIN));
+		CHECK("async result correct", !ioctl(fd, EDU_IOC_FACT_RESULT, &v) && v == fact(10));
+		errno = 0;
+		CHECK("result twice = EINVAL", ioctl(fd, EDU_IOC_FACT_RESULT, &v) < 0 && errno == EINVAL);
+		long t0 = read_timeouts(), t1;
+		for (i = 0, bad = 0; i < 50; i++) {
+			set_timeout(0);
+			do_fact(fd, 12, &v);
+			set_timeout(1000);
+			bad += do_fact(fd, 7, &v) || v != fact(7);
+		}
+		t1 = read_timeouts();
+		CHECK("timeouts were forced", t0 >= 0 && t1 - t0 >= 25);
+		CHECK("correct after forced timeouts", !bad);
+	}
 	printf("%s\n", fails ? "SOME TESTS FAILED" : "ALL TESTS PASSED");
 	return fails != 0;
 }

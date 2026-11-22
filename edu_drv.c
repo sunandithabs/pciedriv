@@ -9,8 +9,13 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/atomic.h>
+#include <linux/iopoll.h>
+#include <linux/poll.h>
+#include <linux/spinlock.h>
+#include <linux/wait.h>
 #include "edu_uapi.h"
 #define EDU_ID         0x00
+#define EDU_LIVE       0x04
 #define EDU_FACT       0x08
 #define EDU_STATUS     0x20
 #define EDU_IRQ_STAT   0x24
@@ -19,22 +24,29 @@
 #define EDU_DMA_DST    0x88
 #define EDU_DMA_CNT    0x90
 #define EDU_DMA_CMD    0x98
+#define EDU_ST_BUSY    BIT(0)
 #define EDU_ST_IRQEN   0x80
+#define EDU_IRQ_FACT   0x01
+#define EDU_IRQ_DMA    0x100
 #define EDU_DMA_START  BIT(0)
 #define EDU_DMA_FROM   BIT(1)
 #define EDU_DMA_IRQ    BIT(2)
 #define EDU_DEV_BUF    0x40000
 #define EDU_BUF_SZ     4096
+enum { EDU_FACT_IDLE, EDU_FACT_RUNNING, EDU_FACT_DONE };
 static bool allow_oops;
 module_param(allow_oops, bool, 0444);
 MODULE_PARM_DESC(allow_oops, "enable EDU_IOC_OOPS (crash-analysis practice)");
 static unsigned int timeout_ms = 1000;
 module_param(timeout_ms, uint, 0644);
-MODULE_PARM_DESC(timeout_ms, "device operation timeout in ms (default 1000)");
+MODULE_PARM_DESC(timeout_ms, "device operation timeout in ms (default 1000, 0 = fail immediately, for tests)");
 struct edu {
 	void __iomem *regs;
 	struct miscdevice misc;
-	struct completion done;
+	struct completion fact_done, dma_done;
+	wait_queue_head_t wq;
+	spinlock_t slock;
+	int fact_state;
 	struct mutex lock;
 	u8 *buf;
 	dma_addr_t buf_dma;
@@ -47,29 +59,64 @@ static irqreturn_t edu_isr(int irq, void *data)
 {
 	struct edu *e = data;
 	u32 st = readl(e->regs + EDU_IRQ_STAT);
+	unsigned long fl;
 	if (!st)
 		return IRQ_NONE;
 	writel(st, e->regs + EDU_IRQ_ACK);
 	atomic64_inc(&e->irqs);
-	complete(&e->done);
+	if (st & EDU_IRQ_FACT) {
+		spin_lock_irqsave(&e->slock, fl);
+		if (e->fact_state == EDU_FACT_RUNNING) {
+			e->fact_state = EDU_FACT_DONE;
+			spin_unlock_irqrestore(&e->slock, fl);
+			wake_up_interruptible(&e->wq);
+		} else {
+			spin_unlock_irqrestore(&e->slock, fl);
+			complete(&e->fact_done);
+		}
+	}
+	if (st & EDU_IRQ_DMA)
+		complete(&e->dma_done);
 	return IRQ_HANDLED;
 }
-static int edu_wait(struct edu *e)
+static int edu_wait(struct edu *e, struct completion *c)
 {
-	if (wait_for_completion_timeout(&e->done, msecs_to_jiffies(timeout_ms)))
+	if (timeout_ms ? wait_for_completion_timeout(c, msecs_to_jiffies(timeout_ms))
+		       : try_wait_for_completion(c))
 		return 0;
 	atomic64_inc(&e->timeouts);
 	return -ETIMEDOUT;
 }
+static int edu_fact_quiesce(struct edu *e)
+{
+	u32 v;
+	if (readl_poll_timeout(e->regs + EDU_STATUS, v, !(v & EDU_ST_BUSY),
+			       10, 100000))
+		return -EBUSY;
+	synchronize_irq(e->irq);
+	return 0;
+}
+static int edu_dma_quiesce(struct edu *e)
+{
+	u64 v;
+	if (readq_poll_timeout(e->regs + EDU_DMA_CMD, v, !(v & EDU_DMA_START),
+			       10, 100000))
+		return -EBUSY;
+	synchronize_irq(e->irq);
+	return 0;
+}
 static int edu_dma(struct edu *e, u64 src, u64 dst, u32 len, u32 cmd)
 {
 	int ret;
-	reinit_completion(&e->done);
+	ret = edu_dma_quiesce(e);
+	if (ret)
+		return ret;
+	reinit_completion(&e->dma_done);
 	writeq(src, e->regs + EDU_DMA_SRC);
 	writeq(dst, e->regs + EDU_DMA_DST);
 	writeq(len, e->regs + EDU_DMA_CNT);
 	writeq(cmd | EDU_DMA_START | EDU_DMA_IRQ, e->regs + EDU_DMA_CMD);
-	ret = edu_wait(e);
+	ret = edu_wait(e, &e->dma_done);
 	if (!ret)
 		atomic64_add(len, &e->dma_bytes);
 	return ret;
@@ -91,11 +138,83 @@ static int edu_dma_test(struct edu *e)
 			return -EIO;
 	return 0;
 }
+static long edu_fact_sync(struct edu *e, u32 __user *p)
+{
+	long ret;
+	u32 v;
+	if (get_user(v, p))
+		return -EFAULT;
+	mutex_lock(&e->lock);
+	if (e->fact_state != EDU_FACT_IDLE) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = edu_fact_quiesce(e);
+	if (ret)
+		goto out;
+	reinit_completion(&e->fact_done);
+	writel(v, e->regs + EDU_FACT);
+	ret = edu_wait(e, &e->fact_done);
+	if (!ret) {
+		atomic64_inc(&e->facts);
+		ret = put_user(readl(e->regs + EDU_FACT), p);
+	}
+out:
+	mutex_unlock(&e->lock);
+	return ret;
+}
+static long edu_fact_start(struct edu *e, u32 __user *p)
+{
+	unsigned long fl;
+	long ret;
+	u32 v;
+	if (get_user(v, p))
+		return -EFAULT;
+	mutex_lock(&e->lock);
+	if (e->fact_state != EDU_FACT_IDLE) {
+		ret = -EBUSY;
+		goto out;
+	}
+	ret = edu_fact_quiesce(e);
+	if (ret)
+		goto out;
+	spin_lock_irqsave(&e->slock, fl);
+	e->fact_state = EDU_FACT_RUNNING;
+	spin_unlock_irqrestore(&e->slock, fl);
+	writel(v, e->regs + EDU_FACT);
+out:
+	mutex_unlock(&e->lock);
+	return ret;
+}
+static long edu_fact_result(struct edu *e, u32 __user *p)
+{
+	unsigned long fl;
+	long ret = 0;
+	int st;
+	mutex_lock(&e->lock);
+	spin_lock_irqsave(&e->slock, fl);
+	if (e->fact_state == EDU_FACT_RUNNING &&
+	    !(readl(e->regs + EDU_STATUS) & EDU_ST_BUSY))
+		e->fact_state = EDU_FACT_DONE;
+	st = e->fact_state;
+	if (st == EDU_FACT_DONE)
+		e->fact_state = EDU_FACT_IDLE;
+	spin_unlock_irqrestore(&e->slock, fl);
+	if (st == EDU_FACT_IDLE) {
+		ret = -EINVAL;
+	} else if (st == EDU_FACT_RUNNING) {
+		ret = -EAGAIN;
+	} else {
+		atomic64_inc(&e->facts);
+		ret = put_user(readl(e->regs + EDU_FACT), p);
+	}
+	mutex_unlock(&e->lock);
+	return ret;
+}
 static long edu_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	struct edu *e = container_of(f->private_data, struct edu, misc);
 	long ret;
-	u32 v;
 	switch (cmd) {
 	case EDU_IOC_OOPS:
 		if (!allow_oops)
@@ -103,19 +222,11 @@ static long edu_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		*(volatile int *)NULL = 1;
 		return 0;
 	case EDU_IOC_FACT:
-		if (get_user(v, (u32 __user *)arg))
-			return -EFAULT;
-		mutex_lock(&e->lock);
-		reinit_completion(&e->done);
-		writel(v, e->regs + EDU_FACT);
-		ret = edu_wait(e);
-		if (!ret) {
-			atomic64_inc(&e->facts);
-			ret = put_user(readl(e->regs + EDU_FACT),
-				       (u32 __user *)arg);
-		}
-		mutex_unlock(&e->lock);
-		return ret;
+		return edu_fact_sync(e, (u32 __user *)arg);
+	case EDU_IOC_FACT_START:
+		return edu_fact_start(e, (u32 __user *)arg);
+	case EDU_IOC_FACT_RESULT:
+		return edu_fact_result(e, (u32 __user *)arg);
 	case EDU_IOC_INFO: {
 		struct edu_info info = {
 			.id = readl(e->regs + EDU_ID),
@@ -174,6 +285,13 @@ static ssize_t edu_read(struct file *f, char __user *ubuf, size_t n,
 	*pos += n;
 	return n;
 }
+static __poll_t edu_poll(struct file *f, poll_table *wait)
+{
+	struct edu *e = container_of(f->private_data, struct edu, misc);
+	poll_wait(f, &e->wq, wait);
+	return READ_ONCE(e->fact_state) == EDU_FACT_DONE ?
+	       EPOLLIN | EPOLLRDNORM : 0;
+}
 static int edu_stats_show(struct seq_file *m, void *unused)
 {
 	struct edu *e = m->private;
@@ -189,6 +307,7 @@ static const struct file_operations edu_fops = {
 	.write = edu_write,
 	.llseek = default_llseek,
 	.unlocked_ioctl = edu_ioctl,
+	.poll = edu_poll,
 };
 static void edu_free_vec(void *p)
 {
@@ -208,6 +327,11 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		return ret;
 	e->regs = pcim_iomap_table(pdev)[0];
+	writel(0x5a5a5a5a, e->regs + EDU_LIVE);
+	if (readl(e->regs + EDU_LIVE) != ~0x5a5a5a5aU) {
+		dev_err(&pdev->dev, "liveness check failed\n");
+		return -ENODEV;
+	}
 	pci_set_master(pdev);
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(28));
 	if (ret)
@@ -216,7 +340,10 @@ static int edu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 				     GFP_KERNEL);
 	if (!e->buf)
 		return -ENOMEM;
-	init_completion(&e->done);
+	init_completion(&e->fact_done);
+	init_completion(&e->dma_done);
+	init_waitqueue_head(&e->wq);
+	spin_lock_init(&e->slock);
 	mutex_init(&e->lock);
 	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_INTX);
 	if (ret < 0)
@@ -263,4 +390,4 @@ static struct pci_driver edu_driver = {
 module_pci_driver(edu_driver);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("QEMU edu PCIe device driver");
-MODULE_VERSION("2.0");
+MODULE_VERSION("2.1");

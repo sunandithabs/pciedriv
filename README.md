@@ -7,6 +7,8 @@ linux pcie driver for qemu's `edu` educational device (`1234:11e8`). covers bar/
 - mmio access to the device's factorial unit, with completion signalled by msi (falls back to intx)
 - `read()`/`write()` on `/dev/edu`: each call does a dma transfer to/from the device's 4 kb buffer, with offsets via `lseek`/`pread`/`pwrite`
 - `ioctl` interface: factorial, dma round-trip self-test, device info, optional crash trigger
+- async factorial: `EDU_IOC_FACT_START` then `poll()` for `POLLIN`, then `EDU_IOC_FACT_RESULT`
+- liveness-register check at probe
 - `debugfs` stats at `/sys/kernel/debug/edu/stats` (irqs, fact ops, dma bytes, timeouts)
 - `timeout_ms` module parameter (runtime-tunable)
 - mutex-serialized device access; irqs masked on remove
@@ -29,6 +31,8 @@ make              # build module + test binary only
 | `EDU_IOC_FACT` | in: n, out: n! (mod 2^32) |
 | `EDU_IOC_DMA_TEST` | 4 kb dma round trip, 0 = ok |
 | `EDU_IOC_INFO` | `struct edu_info`: id, irq, msi, buf_size |
+| `EDU_IOC_FACT_START` | in: n, starts factorial without blocking |
+| `EDU_IOC_FACT_RESULT` | out: n!; `EAGAIN` if running, `EINVAL` if none pending |
 | `EDU_IOC_OOPS` | null deref for crash analysis; needs `allow_oops=1` |
 
 | module param | default | description |
@@ -49,6 +53,7 @@ map the `edu_ioctl+0x..` offset from the oops to a source line with `gdb edu_drv
 
 ## changelog
 
+- **2.1**: async factorial with `poll()`, separate fact/dma completions, device quiesce before each op (late-irq race), liveness check, negative and timeout tests.
 - **2.0**: read/write dma path, `EDU_IOC_INFO`, debugfs stats, `timeout_ms`, irq masking on remove, expanded tests.
 - **1.0**: mmio, msi, dma self-test, misc device, oops trigger.
 

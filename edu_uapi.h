@@ -12,4 +12,6 @@ struct edu_info {
 #define EDU_IOC_DMA_TEST  _IO('E', 2)
 #define EDU_IOC_OOPS      _IO('E', 3)
 #define EDU_IOC_INFO      _IOR('E', 4, struct edu_info)
+#define EDU_IOC_FACT_START  _IOW('E', 5, __u32)
+#define EDU_IOC_FACT_RESULT _IOR('E', 6, __u32)
 #endif

@@ -2,8 +2,6 @@
 
 linux pcie driver for qemu's `edu` educational device (`1234:11e8`). covers bar/mmio mapping, msi interrupts, coherent dma under a 28-bit mask, and a misc character device, with a self-contained qemu test harness.
 
-**v2.0**
-
 ## features
 
 - mmio access to the device's factorial unit, with completion signalled by msi (falls back to intx)
@@ -54,4 +52,6 @@ map the `edu_ioctl+0x..` offset from the oops to a source line with `gdb edu_drv
 - **2.0**: read/write dma path, `EDU_IOC_INFO`, debugfs stats, `timeout_ms`, irq masking on remove, expanded tests.
 - **1.0**: mmio, msi, dma self-test, misc device, oops trigger.
 
-gpl-2.0
+## license
+
+gpl-2.0. see license.
